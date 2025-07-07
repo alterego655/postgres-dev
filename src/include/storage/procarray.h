@@ -100,4 +100,9 @@ extern void ProcArraySetReplicationSlotXmin(TransactionId xmin,
 extern void ProcArrayGetReplicationSlotXmin(TransactionId *xmin,
 											TransactionId *catalog_xmin);
 
+/* Per-XID waiting support for hot standby servers */
+extern bool StandbyXidWait(TransactionId xid);
+extern void WakeXidWaiters(TransactionId xid);
+extern void WakeAllXidWaiters(void);
+
 #endif							/* PROCARRAY_H */
