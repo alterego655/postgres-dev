@@ -306,6 +306,32 @@ static GlobalVisState GlobalVisTempRels;
  */
 static TransactionId ComputeXidHorizonsResultLastXmin;
 
+/*
+ * XID waiter hash table partition count
+ */
+#define NUM_XID_WAIT_PARTITIONS  16   /* Must be power of 2 */
+
+/*
+ * Hash table entry for per-XID waiting on standby servers.
+ */
+typedef struct XidWaitEntry
+{
+	TransactionId xid;				/* transaction ID being waited for */
+	ConditionVariable cv;			/* condition variable for this XID */
+	pg_atomic_uint32 waiter_count;	/* number of backends waiting */
+	bool		initialized;		/* true when entry is fully set up */
+} XidWaitEntry;
+
+/*
+ * Global hash table for XID waiting.
+ *
+ * This hash table maps transaction IDs to XidWaitEntry structures,
+ * enabling efficient per-XID waiting during hot standby recovery.
+ * The table is partitioned to reduce lock contention and uses the
+ * same infrastructure as PostgreSQL's lock manager.
+ */
+static HTAB *XidWaitHash = NULL;
+
 #ifdef XIDCACHE_DEBUG
 
 /* counters for XidCache measurement */
@@ -368,6 +394,7 @@ static void MaintainLatestCompletedXidRecovery(TransactionId latestXid);
 static inline FullTransactionId FullXidRelativeTo(FullTransactionId rel,
 												  TransactionId xid);
 static void GlobalVisUpdateApply(ComputeXidHorizonsResult *horizons);
+static void WakeXidWaiters(TransactionId xid);
 
 /*
  * Report shared-memory space needed by ProcArrayShmemInit
@@ -401,11 +428,23 @@ ProcArrayShmemSize(void)
 
 	if (EnableHotStandby)
 	{
+		long		max_xid_waiters;
+
 		size = add_size(size,
 						mul_size(sizeof(TransactionId),
 								 TOTAL_MAX_CACHED_SUBXIDS));
 		size = add_size(size,
 						mul_size(sizeof(bool), TOTAL_MAX_CACHED_SUBXIDS));
+
+		/*
+		 * XID waiter hash table sizing: hybrid approach that scales
+		 * appropriately for both small and large systems with varying
+		 * subtransaction loads. The /4 factor assumes ~25% of known
+		 * assigned XIDs are actively waited on.
+		 */
+		max_xid_waiters = Max(MaxBackends * 2,
+							  TOTAL_MAX_CACHED_SUBXIDS / 4);
+		size = add_size(size, hash_estimate_size(max_xid_waiters, sizeof(XidWaitEntry)));
 	}
 
 	return size;
@@ -458,6 +497,29 @@ ProcArrayShmemInit(void)
 			ShmemInitStruct("KnownAssignedXidsValid",
 							mul_size(sizeof(bool), TOTAL_MAX_CACHED_SUBXIDS),
 							&found);
+
+		/* Initialize XID waiter hash table for standby XID waiting */
+		{
+			HASHCTL info;
+			long max_xid_waiters;
+
+			/*
+			 * Use same hybrid sizing formula as ProcArrayShmemSize() to ensure
+			 * consistency between memory allocation and hash table creation.
+			 */
+			max_xid_waiters = Max(MaxBackends * 2,
+								  TOTAL_MAX_CACHED_SUBXIDS / 4);
+
+			info.keysize = sizeof(TransactionId);
+			info.entrysize = sizeof(XidWaitEntry);
+			info.num_partitions = NUM_XID_WAIT_PARTITIONS;
+
+			XidWaitHash = ShmemInitHash("XID Wait Hash",
+									   max_xid_waiters / 2,  /* init_size */
+									   max_xid_waiters,      /* max_size */
+									   &info,
+									   HASH_ELEM | HASH_BLOBS | HASH_PARTITION);
+		}
 	}
 }
 
@@ -5001,6 +5063,9 @@ KnownAssignedXidsRemove(TransactionId xid)
 	 * So, just ignore the search result.
 	 */
 	(void) KnownAssignedXidsSearch(xid, true);
+
+	/* Wake waiters for this specific XID as we expire it */
+	WakeXidWaiters(xid);
 }
 
 /*
@@ -5069,6 +5134,8 @@ KnownAssignedXidsRemovePreceding(TransactionId removeXid)
 			if (!StandbyTransactionIdIsPrepared(knownXid))
 			{
 				KnownAssignedXidsValid[i] = false;
+				/* Wake waiters for this specific XID as we expire it */
+				WakeXidWaiters(knownXid);
 				count++;
 			}
 		}
@@ -5264,4 +5331,104 @@ KnownAssignedXidsReset(void)
 	pArray->headKnownAssignedXids = 0;
 
 	LWLockRelease(ProcArrayLock);
+}
+
+/*
+ * Wait for XID completion using condition variables.
+ *
+ * This function implements efficient waiting for transaction completion
+ * on standby servers by using a hash table of condition variables keyed
+ * by transaction ID. This replaces polling-based approaches with direct
+ * event notification.
+ *
+ * The function handles the complete lifecycle of waiting: finding or
+ * creating the hash entry, managing waiter counts, and cleaning up
+ * when the last waiter finishes.
+ *
+ * Note: This function is only meaningful during hot standby recovery.
+ * Primary servers should use the lock-based waiting mechanisms.
+ */
+void
+StandbyXidWait(TransactionId xid)
+{
+	XidWaitEntry *entry;
+	bool		found;
+	uint32		hashcode;
+
+	Assert(InHotStandby);
+	Assert(XidWaitHash);
+
+	/* Quick exit if transaction already complete */
+	if (!TransactionIdIsInProgress(xid))
+		return;
+
+	/* Get hash code for partition locking */
+	hashcode = get_hash_value(XidWaitHash, &xid);
+
+	/* Find or create hash entry */
+	entry = hash_search_with_hash_value(XidWaitHash, &xid, hashcode,
+									   HASH_ENTER, &found);
+
+	if (!found)
+	{
+		/* Initialize new entry */
+		entry->xid = xid;
+		ConditionVariableInit(&entry->cv);
+		pg_atomic_init_u32(&entry->waiter_count, 0);
+		entry->initialized = true;
+	}
+
+	/* Increment waiter count */
+	pg_atomic_fetch_add_u32(&entry->waiter_count, 1);
+
+	/* Standard PostgreSQL condition variable waiting pattern */
+	ConditionVariablePrepareToSleep(&entry->cv);
+
+	/* Wait loop with condition re-checking */
+	while (TransactionIdIsInProgress(xid))
+	{
+		ConditionVariableSleep(&entry->cv, WAIT_EVENT_XACT_COMPLETE);
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	/* Standard cleanup - PostgreSQL's exception system handles errors */
+	ConditionVariableCancelSleep();
+
+	/* Decrement waiter count and cleanup if last waiter */
+	if (pg_atomic_fetch_sub_u32(&entry->waiter_count, 1) == 1)
+	{
+		hash_search_with_hash_value(XidWaitHash, &xid, hashcode,
+								   HASH_REMOVE, NULL);
+	}
+}
+
+/*
+ * Wake waiters for a specific XID.
+ *
+ * This function is called when a transaction completes on the primary
+ * server and we need to wake up any standby processes that were waiting
+ * for that specific transaction ID.
+ *
+ * Uses the hash table to locate waiters for the specified XID and
+ * broadcasts on the associated condition variable to wake all waiting
+ * backends simultaneously.
+ */
+static void
+WakeXidWaiters(TransactionId xid)
+{
+	XidWaitEntry *entry;
+	uint32		hashcode;
+
+	Assert(InHotStandby);
+	Assert(XidWaitHash);
+
+	hashcode = get_hash_value(XidWaitHash, &xid);
+
+	entry = hash_search_with_hash_value(XidWaitHash, &xid, hashcode,
+									   HASH_FIND, NULL);
+	if (entry && entry->initialized)
+	{
+		/* Wake all waiters for this specific XID */
+		ConditionVariableBroadcast(&entry->cv);
+	}
 }
