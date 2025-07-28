@@ -652,6 +652,10 @@ XactLockTableDelete(TransactionId xid)
  * is specified, an error context callback is set up.  If 'oper' is passed as
  * None, no error context callback is set up.
  *
+ * On standby servers, uses efficient per-XID condition variable waiting
+ * instead of traditional lock acquisition.  On primary servers, uses the
+ * standard lock table approach.
+ *
  * Note that this does the right thing for subtransactions: if we wait on a
  * subtransaction, we will exit as soon as it aborts or its top parent commits.
  * It takes some extra work to ensure this, because to save on shared memory
@@ -687,6 +691,20 @@ XactLockTableWait(TransactionId xid, Relation rel, ItemPointer ctid,
 		error_context_stack = &callback;
 	}
 
+	/* Try efficient per-XID wait first on standby */
+	if (RecoveryInProgress())
+	{
+		Assert(TransactionIdIsValid(xid));
+		Assert(!TransactionIdEquals(xid, GetTopTransactionIdIfAny()));
+
+		StandbyXidWait(xid);
+
+		if (oper != XLTW_None)
+			error_context_stack = callback.previous;
+
+		return;
+	}
+
 	for (;;)
 	{
 		Assert(TransactionIdIsValid(xid));
@@ -718,7 +736,6 @@ XactLockTableWait(TransactionId xid, Relation rel, ItemPointer ctid,
 		 */
 		if (!first)
 		{
-			CHECK_FOR_INTERRUPTS();
 			pg_usleep(1000L);
 		}
 		first = false;
@@ -734,12 +751,28 @@ XactLockTableWait(TransactionId xid, Relation rel, ItemPointer ctid,
  *
  * As above, but only lock if we can get the lock without blocking.
  * Returns true if the lock was acquired.
+ *
+ * On standby servers, returns false if the transaction is still in progress
+ * (since condition variable waiting would block).  On primary servers, uses
+ * conditional lock acquisition.
  */
 bool
 ConditionalXactLockTableWait(TransactionId xid, bool logLockFailure)
 {
 	LOCKTAG		tag;
 	bool		first = true;
+
+	/* Try efficient per-XID wait on standby */
+	if (RecoveryInProgress())
+	{
+		Assert(TransactionIdIsValid(xid));
+		Assert(!TransactionIdEquals(xid, GetTopTransactionIdIfAny()));
+
+		if (!TransactionIdIsInProgress(xid))
+			return true;
+
+		return false;
+	}
 
 	for (;;)
 	{
@@ -761,7 +794,6 @@ ConditionalXactLockTableWait(TransactionId xid, bool logLockFailure)
 		/* See XactLockTableWait about this case */
 		if (!first)
 		{
-			CHECK_FOR_INTERRUPTS();
 			pg_usleep(1000L);
 		}
 		first = false;
